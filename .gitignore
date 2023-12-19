@@ -2,3 +2,5 @@ dump
 *.pyc
 *.swp
 *.swo
+
+secrets.json

@@ -27,7 +27,7 @@ class ModelConfig:
     gradient_checkpointing: bool = False
     model_parallel: bool = False
     default_optimizer: str = "adam"
-
+    checkpoint: Optional[int] = None
 
 def train_model(
     model: torch.nn.Module,
@@ -121,10 +121,16 @@ def train_model(
             logits = model(input_ids)
 
             all_logits.extend(logits.to(io_device))
-            all_labels.extend(labels)
+
+            all_labels.extend(labels.to(logits.dtype))
         all_logits = torch.stack(all_logits)
         all_labels = torch.stack(all_labels)
         loss = loss_fn(all_logits, all_labels, step_frac=step / nsteps)
+
+        if loss.isnan():
+            print("NAN LOSS")
+            break
+
         loss_tot += loss.item()
         loss.backward()
         losses.append(loss_tot)
@@ -164,35 +170,19 @@ def train_model(
     return final_eval_results
 
 
-def train_and_save_model(
+def load_model(
     model_config: ModelConfig,
-    train_ds: datasets.Dataset,
-    test_ds: datasets.Dataset,
-    inference_ds: Optional[datasets.Dataset] = None,
-    *,
     batch_size: int,
-    lr: float,
-    epochs: int,
-    eval_batch_size: Optional[int] = None,
-    minibatch_size_per_device: Optional[int] = None,
-    save_path: Optional[str] = None,
-    loss_fn: Callable = xent_loss,
-    label: str = "default",
-    force_retrain: bool = False,
-    train_with_dropout: bool = False,
-    linear_probe: bool = False,
-    lr_schedule: str = "constant",
-    optimizer_name: str = "adam",
-    eval_every: Optional[int] = None,
+    minibatch_size_per_device: int,
+    save_path: str,
+    force_retrain: bool,
+    linear_probe: bool,
+    **custom_kwargs,
 ):
-    if eval_batch_size is None:
-        eval_batch_size = batch_size
+    print("loading model", model_config.name)
 
-    if minibatch_size_per_device is None:
-        minibatch_size_per_device = 1
-
-    gradient_checkpointing = model_config.gradient_checkpointing
-    custom_kwargs = model_config.custom_kwargs or {}
+    if model_config.checkpoint is not None:
+        custom_kwargs["revision"] = "step" + str(model_config.checkpoint)
 
     def maybe_load_model(model):
         if os.path.exists(os.path.join(save_path, "results.pkl")) and not force_retrain:
@@ -226,9 +216,10 @@ def train_and_save_model(
         # slight misnomer, more like minibatch_size_per_dp_replica
         minibatch_size = minibatch_size_per_device
     else:
+        print(custom_kwargs)
         model = TransformerWithHead.from_pretrained(
             model_config.name, num_labels=2, linear_probe=linear_probe, **custom_kwargs
-        ).to("cuda")
+        ).cuda()
         already_trained = maybe_load_model(model)
         # data parallel:  currently not supported with model parallel
         if torch.cuda.device_count() > 1:
@@ -240,6 +231,48 @@ def train_and_save_model(
                 "GPUs, setting minibatch_size to",
                 minibatch_size,
             )
+    
+    return model, already_trained, minibatch_size
+
+def train_and_save_model(
+    model_config: ModelConfig,
+    train_ds: datasets.Dataset,
+    test_ds: datasets.Dataset,
+    inference_ds: Optional[datasets.Dataset] = None,
+    *,
+    batch_size: int,
+    lr: float,
+    epochs: int,
+    eval_batch_size: Optional[int] = None,
+    minibatch_size_per_device: Optional[int] = None,
+    save_path: Optional[str] = None,
+    loss_fn: Callable = xent_loss,
+    label: str = "default",
+    force_retrain: bool = False,
+    train_with_dropout: bool = False,
+    linear_probe: bool = False,
+    lr_schedule: str = "constant",
+    optimizer_name: str = "adam",
+    eval_every: Optional[int] = None,
+):
+    if eval_batch_size is None:
+        eval_batch_size = batch_size
+
+    if minibatch_size_per_device is None:
+        minibatch_size_per_device = 1
+
+    gradient_checkpointing = model_config.gradient_checkpointing
+    custom_kwargs = model_config.custom_kwargs or {}
+
+    model, already_trained, minibatch_size = load_model(
+        model_config,
+        batch_size,
+        minibatch_size_per_device,
+        save_path,
+        force_retrain,
+        linear_probe,
+        **custom_kwargs,
+    )
 
     if already_trained:
         test_results = eval_model_acc(model, test_ds, eval_batch_size)
@@ -265,7 +298,8 @@ def train_and_save_model(
         if save_path:
             # Note: If the model is wrapped by DataParallel, we need to unwrap it before saving
             (model if hasattr(model, "save_pretrained") else model.module).save_pretrained(
-                save_path
+                save_path,
+                safe_serialization=False,
             )
             print("saved", save_path)
 
