@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import os
+import shutil
 
 import numpy as np
 
@@ -24,6 +25,8 @@ from trl import SFTTrainer
 from typing import Callable, TypeVar, Optional, Type, Any, cast, Tuple, List
 
 from weak_to_strong.eval import eval_model_acc
+
+from sklearn.metrics import roc_auc_score
 
 class LastTokenOnlyDataCollator(DataCollatorForLanguageModeling):
     def torch_call(
@@ -94,9 +97,12 @@ def dict_vmap(func: DictFn) -> VmappedFn:
 def get_model_path(
     model_name: str,
     label: str,
-    save_path: str,
+    save_path: Optional[str],
     model_ckpt: Optional[int] = None,
-) -> str:
+) -> Optional[str]:
+    if save_path is None:
+        return None
+
     model_short = model_name.split("/")[-1]
 
     if model_ckpt is None:
@@ -123,14 +129,13 @@ def get_neox_lora_modules(
 
     return mlps + attns
 
-def process_test_dataset(
+def parse_dataset(
     dataset: Dataset,
     tokenizer,
-    max_ctx: int,
 ) -> Dataset:
     def process_function(res):
-        input_ids = tokenizer(res["text"])["input_ids"]
-        label = tokenizer(res["completion"])["input_ids"][-1]
+        input_ids = tokenizer(res["prompt"])["input_ids"]
+        label = tokenizer(res["label"])["input_ids"][-1]
         return dict(
             input_ids=input_ids,
             label=label,
@@ -138,12 +143,24 @@ def process_test_dataset(
 
     return dataset.map(process_function)
 
+def parse_test_dataset(
+    dataset: Dataset,
+    options: List[str],
+    tokenizer,
+) -> Tuple[Dataset, List[int]]:
+
+    class_tokens = [
+        tokenizer(options[i])["input_ids"][-1]
+        for i in range(len(options))
+    ]
+
+    return parse_dataset(dataset, tokenizer), class_tokens
 
 def eval_model_acc_peft(
     model: torch.nn.Module,
     ds: Dataset,
+    class_tokens: List[int],
     eval_batch_size: int = 16,
-    options: Optional[List[int]] = None,
 ) -> None:
     """
     This function evaluates the accuracy of a given model on a given dataset.
@@ -178,53 +195,95 @@ def eval_model_acc_peft(
 
             input_lens = (input_ids != 0).sum(dim=-1)
 
-            labels = batch["label"]
-
-            if options is not None:
-                labels = [options.index(l) for l in labels]
+            labels = [class_tokens.index(ex) for ex in batch["label"]]
 
             # run forward pass
             raw_logits = model(input_ids).logits
-            raw_logits = torch.stack(
-                [raw_logits[i, input_lens[i] - 1, :] for i in range(len(input_lens))]
-            )
-
-            if options is not None:
-                raw_logits = raw_logits[:, options]
+            raw_logits = torch.stack([
+                raw_logits[i, input_lens[i] - 1, class_tokens] for i in range(len(input_lens))
+            ])
 
             probs = unpack(torch.nn.functional.softmax(raw_logits, dim=-1))
-            preds = unpack(torch.argmax(raw_logits, axis=-1))
+            preds = raw_logits.argmax(dim=-1).detach().cpu().numpy().tolist()
 
             results.extend(
                 [
                     dict(
-                        label=label,
                         pred=pred,
-                        probs=prob,
-                        acc=int(pred == label),
+                        prob=prob,
+                        label=label,
                     )
-                    for label, pred, prob in zip(
-                        labels, preds, probs
-                    )
+                    for pred, prob, label in zip(preds, probs, labels)
                 ]
             )
-        accs = [r["acc"] for r in results]
-        print("Accuracy:", np.mean(accs), "+/-", np.std(accs) / np.sqrt(len(accs)))
+        
+        # calculate AUROC
+        preds = np.array([result["pred"] for result in results])
+        probs = np.array([result["prob"] for result in results])
+        labels = np.array([result["label"] for result in results])
 
-        return Dataset.from_list(results)
+        auroc = roc_auc_score(labels, probs[:, 1])
 
-def train_and_save_model_peft(
+        return auroc, preds
+
+def replace_labels(
+    ds: Dataset,
+    new_labels: list[int],
+    class_labels: list[str],
+) -> Dataset:
+    # cursed, but idk how to get SFTrainer to work with soft labels.
+    new_labels_ds = Dataset.from_dict({
+        "completion": [class_labels[i] for i in new_labels],
+    })
+
+    ds = ds.remove_columns(["completion", "label", "input_ids"])
+
+    ds = concatenate_datasets([new_labels_ds, ds], axis=1)
+
+    return ds
+
+def parse_dataset(
+    dataset: Dataset,
+    tokenizer,
+) -> Dataset:
+    def process_function(res):
+        input_ids = tokenizer(res["prompt"])["input_ids"]
+        label = tokenizer(res["completion"])["input_ids"][-1]
+        return dict(
+            input_ids=input_ids,
+            label=label,
+        )
+
+    return dataset.map(process_function)
+
+def parse_test_dataset(
+    dataset: Dataset,
+    options: List[str],
+    tokenizer,
+) -> Tuple[Dataset, List[int]]:
+
+    class_tokens = [
+        tokenizer(options[i])["input_ids"][-1]
+        for i in range(len(options))
+    ]
+
+    return parse_dataset(dataset, tokenizer), class_tokens
+
+def train_model_peft(
     model_name: str,
+    label: str,
+    save_path: Optional[str] = None,
+    *,
     train_ds: Dataset,
-    test_ds: Dataset,
+    eval_ds: Dataset,
+    class_labels: list[str],
+    inference_ds: Optional[Dataset] = None,
     per_gpu_batch_size: int = 8,
-    lr: float = 2e-5,
+    lr: float = 1e-4,
     epochs: int = 2,
     model_ckpt: Optional[int] = None,
     lora_rank: int = 0,
     lora_modules: Optional[list[str]] = None,
-    save_path: Optional[str] = None,
-    label: str = "default",
 ):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -232,42 +291,33 @@ def train_and_save_model_peft(
 
     def format_fn(ex):
         return [
-            text + completion
-            for text, completion in zip(ex["text"], ex["completion"])
+            prompt + label
+            for prompt, label in zip(ex["prompt"], ex["completion"])
         ]
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        device_map={"": torch.cuda.current_device()},
-        #torch_dtype=torch.float32 if lora_rank <= 0 else "auto",
+        device_map="auto",
+        revision = f"step{model_ckpt}" if model_ckpt is not None else "main",
     )
-
-    test_ds = process_test_dataset(test_ds, tokenizer, max_ctx=1024)
-
-    eval_results = eval_model_acc_peft(
-        model,
-        test_ds,
-        eval_batch_size=16,
-    )
-    print(eval_results)
 
     trainer = SFTTrainer(
         model=model,
         args=TrainingArguments(
+            fp16=True,
             output_dir=get_model_path(model_name, label, save_path, model_ckpt=model_ckpt),
-            #fp16=True,
             gradient_accumulation_steps=1,
             learning_rate=lr,
             logging_steps=50,
             num_train_epochs=epochs,
-            optim=("adamw_torch" if lora_rank > 0 else "adamw_bnb_8bit"),
+            optim="adamw_torch",
             adam_beta2=0.95,
             per_device_train_batch_size=per_gpu_batch_size,
             remove_unused_columns=False,
             report_to="none",
             save_steps=4000,
-            warmup_steps=1000,
-            weight_decay=0.1,
+            warmup_steps=100,
+            lr_scheduler_type="linear",
         ),
         formatting_func=format_fn,
         data_collator=LastTokenOnlyDataCollator(tokenizer, mlm=False),
@@ -283,34 +333,105 @@ def train_and_save_model_peft(
     )
     trainer.train()
 
-    eval_results = eval_model_acc_peft(
-        model,
-        test_ds,
-        eval_batch_size=16,
-    )
-    print(eval_results)
+    return trainer, model
 
-def delete_saved_peft_model(
+def train_or_load_model_peft(
     model_name: str,
-    save_path: str,
     label: str,
+    save_path: Optional[str] = None,
+    *,
+    train_ds: Dataset,
+    eval_ds: Dataset,
+    class_labels: list[str],
+    inference_ds: Optional[Dataset] = None,
+    per_gpu_batch_size: int = 8,
+    lr: float = 1e-4,
+    epochs: int = 2,
+    model_ckpt: Optional[int] = None,
+    lora_rank: int = 0,
+    lora_modules: Optional[list[str]] = None,
+    force_retrain: bool = False,
+):
+    if model_ckpt is not None:
+        print(f"Finetuning {model_name}/{label}, step = {model_ckpt}.")
+    else:
+        print(f"Finetuning {model_name}/{label}.")
+
+    # check if model already exists
+    path = get_model_path(model_name, label, save_path, model_ckpt=model_ckpt)
+
+    if path is not None and os.path.exists(path) and not force_retrain:
+        print("Model already exists, skipping training.")
+        model = AutoModelForCausalLM.from_pretrained(
+            path,
+            device_map="auto",
+        )
+    else:
+        trainer, model = train_model_peft(
+            model_name,
+            label,
+            save_path=save_path,
+            train_ds=train_ds,
+            eval_ds=eval_ds,
+            class_labels=class_labels,
+            inference_ds=inference_ds,
+            per_gpu_batch_size=per_gpu_batch_size,
+            lr=lr,
+            epochs=epochs,
+            model_ckpt=model_ckpt,
+            lora_rank=lora_rank,
+            lora_modules=lora_modules,
+        )
+        if path is not None:
+            trainer.save_model(path)
+    
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    eval_ds, class_tokens = parse_test_dataset(
+        eval_ds,
+        class_labels,
+        tokenizer,
+    )
+
+    eval_auroc, _ = eval_model_acc_peft(
+        model,
+        eval_ds,
+        class_tokens,
+    )
+
+    print(f"Eval AUROC: {eval_auroc}")
+
+    new_ds = None
+
+    if inference_ds is not None:
+        inference_ds, class_tokens = parse_test_dataset(
+            inference_ds,
+            class_labels,
+            tokenizer,
+        )
+
+        inference_auroc, inferred_labels = eval_model_acc_peft(
+            model,
+            inference_ds,
+            class_tokens,
+        )
+
+        print(f"Inference AUROC: {inference_auroc}")
+
+        new_ds = replace_labels(
+            inference_ds,
+            inferred_labels,
+            class_labels,
+        )
+    
+    return eval_auroc, new_ds
+
+def delete_saved_model_peft(
+    model_name: str,
+    label: str,
+    save_path: Optional[str] = None,
     model_ckpt: Optional[int] = None,
 ) -> None:
     path = get_model_path(model_name, label, save_path, model_ckpt=model_ckpt)
-    os.remove(path)
-
-def eval_saved_peft_model(
-    model_name: str,
-    save_path: str,
-    label: str,
-    dataset: Dataset,
-    model_ckpt: Optional[int] = None,
-    eval_batch_size: int = 16,
-) -> None:
-    model = AutoModelForCausalLM.from_pretrained(
-        get_model_path(model_name, label, save_path, model_ckpt=model_ckpt),
-        device_map="auto",
-        torch_dtype=torch.float32,
-    )
-
-    return eval_model_acc_peft(model, dataset, eval_batch_size=eval_batch_size)
+    if os.path.exists(path):
+        shutil.rmtree(path)
