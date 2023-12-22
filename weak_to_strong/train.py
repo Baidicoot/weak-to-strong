@@ -11,6 +11,15 @@ import torch
 import torch_optimizer as toptim
 from transformers.modeling_utils import load_sharded_checkpoint
 
+from peft import LoraConfig  # type: ignore
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    DataCollatorForLanguageModeling,
+    TrainingArguments,
+)
+from trl import SFTTrainer
+
 import weak_to_strong.logger as logger
 from weak_to_strong.common import clear_mem
 from weak_to_strong.eval import eval_model_acc
@@ -99,6 +108,7 @@ def train_model(
             if train_with_dropout:
                 model.train()
             eval_accs = np.mean([r["acc"] for r in eval_results])
+            print(f"Eval accuracy at step {step}/{nsteps}:", eval_accs)
             eval_acc_dict[step] = eval_accs
             logger.logkv("eval_accuracy", eval_accs)
         all_logits = []
@@ -163,12 +173,11 @@ def train_model(
         logger.dumpkvs()
     final_eval_results = None
     if eval_every:
-        print("Final evaluation:")
         final_eval_results = eval_model_acc(model, eval_ds, eval_batch_size)
+        print("Final eval accuracy:", np.mean([r["acc"] for r in final_eval_results]))
         logger.logkv("eval_accuracy", np.mean([r["acc"] for r in final_eval_results]))
         logger.dumpkvs()
     return final_eval_results
-
 
 def load_model(
     model_config: ModelConfig,
@@ -190,20 +199,33 @@ def load_model(
             checkpoint_path = os.path.join(save_path, "pytorch_model.bin")
             if not os.path.exists(checkpoint_path):
                 # Assume this means we have a sharded checkpoint, and load it appropriately
-                load_sharded_checkpoint(model, checkpoint_path)
+                load_sharded_checkpoint(model, save_path)
             else:
                 state_dict = torch.load(os.path.join(save_path, "pytorch_model.bin"))
                 state_dict = {
                     k.replace("transformer.module", "transformer"): v
                     for (k, v) in state_dict.items()
                 }
-                custom_kwargs["state_dict"] = state_dict
+                # load state_dict into model
+                model.load_state_dict(state_dict)
             return True
         return False
 
     already_trained = False
-    # Load the model
+
     if model_config.model_parallel:
+        minibatch_size = minibatch_size_per_device
+    else:
+        minibatch_size = min(minibatch_size_per_device * torch.cuda.device_count(), batch_size)
+        print(
+            "Using",
+            torch.cuda.device_count(),
+            "GPUs, setting minibatch_size to",
+            minibatch_size,
+        )
+
+    if model_config.model_parallel:
+        print("using model parallelism")
         assert torch.cuda.device_count() > 1, f"you might want more gpus for {model_config.name}"
         model = TransformerWithHead.from_pretrained(
             model_config.name,
@@ -213,10 +235,7 @@ def load_model(
             **custom_kwargs,
         )
         already_trained = maybe_load_model(model)
-        # slight misnomer, more like minibatch_size_per_dp_replica
-        minibatch_size = minibatch_size_per_device
     else:
-        print(custom_kwargs)
         model = TransformerWithHead.from_pretrained(
             model_config.name, num_labels=2, linear_probe=linear_probe, **custom_kwargs
         ).cuda()
@@ -224,13 +243,6 @@ def load_model(
         # data parallel:  currently not supported with model parallel
         if torch.cuda.device_count() > 1:
             model = torch.nn.DataParallel(model, output_device=0)
-            minibatch_size = min(minibatch_size_per_device * torch.cuda.device_count(), batch_size)
-            print(
-                "Using",
-                torch.cuda.device_count(),
-                "GPUs, setting minibatch_size to",
-                minibatch_size,
-            )
     
     return model, already_trained, minibatch_size
 
@@ -297,7 +309,7 @@ def train_and_save_model(
         print("Model training took", time.time() - start, "seconds")
         if save_path:
             # Note: If the model is wrapped by DataParallel, we need to unwrap it before saving
-            (model if hasattr(model, "save_pretrained") else model.module).save_pretrained(
+            model.save_pretrained(
                 save_path,
                 safe_serialization=False,
             )
@@ -306,6 +318,7 @@ def train_and_save_model(
     inference_results = None
     if inference_ds:
         inference_results = eval_model_acc(model, inference_ds, eval_batch_size)
+        #print("Inference accuracy:", np.mean([r["acc"] for r in inference_results]))
         logger.logkv("inference_accuracy", np.mean([r["acc"] for r in inference_results]))
 
     if save_path:

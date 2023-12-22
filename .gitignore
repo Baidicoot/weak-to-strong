@@ -3,4 +3,6 @@ dump
 *.swp
 *.swo
 
+.env
+
 secrets.json

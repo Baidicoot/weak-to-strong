@@ -97,13 +97,15 @@ register_dataset(
 
 def format_sciq(ex, rng):
     hard_label = int(rng.random() < 0.5)
+    choice = " Yes" if hard_label else " No"
     if hard_label:
         ans = ex["correct_answer"]
     else:
         ans = rng.choice([ex["distractor1"], ex["distractor2"], ex["distractor3"]])
-    txt = f"Q: {ex['question']} A: {ans}"
-    return dict(txt=txt, hard_label=hard_label)
+    question = ex["question"]
 
+    txt = f"Question: {question}\nIs the answer \"{ans}\"?\nAnswer (Yes/No):{choice}"
+    return dict(txt=txt, answer=choice)
 
 register_dataset(
     "sciq",

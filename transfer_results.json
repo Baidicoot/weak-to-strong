@@ -1,0 +1,1 @@
+{"EleutherAI/pythia-410m-v0": {"strong_gt_acc": 0.679, "strong_transfer_acc": 0.643}, "EleutherAI/pythia-1b-v0": {"strong_gt_acc": 0.698, "strong_transfer_acc": 0.624}, "EleutherAI/pythia-1.4b-v0": {"strong_gt_acc": 0.688, "strong_transfer_acc": 0.648}, "EleutherAI/pythia-2.8b-v0": {"strong_gt_acc": 0.696, "strong_transfer_acc": 0.633}}

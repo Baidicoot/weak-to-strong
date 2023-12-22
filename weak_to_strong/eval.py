@@ -64,6 +64,6 @@ def eval_model_acc(model: nn.Module, ds: datasets.Dataset, eval_batch_size: int 
                 ]
             )
         accs = [r["acc"] for r in results]
-        print("Accuracy:", np.mean(accs), "+/-", np.std(accs) / np.sqrt(len(accs)))
+        #print("Accuracy:", np.mean(accs), "+/-", np.std(accs) / np.sqrt(len(accs)))
 
         return datasets.Dataset.from_list(results)
